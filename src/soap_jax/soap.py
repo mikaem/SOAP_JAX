@@ -1,22 +1,48 @@
 from itertools import chain
-from typing import List, NamedTuple, Optional, Union
+from typing import NamedTuple, Optional, Sequence, Union
 
+import chex
 import jax
 import jax.numpy as jnp
-import jax.tree_util as jtu
 import optax
 import optax.tree_utils as otu
-from chex import Numeric
+from flax.nnx import State
 from jaxtyping import Array
 from optax import GradientTransformation, Updates
+from optax._src import numerics
 
 
 class SOAPState(NamedTuple):
-    count: jnp.ndarray  # type: ignore
+    count: chex.Numeric
     exp_avg: Updates
     exp_avg_sq: Updates
     GG: Updates
     Q: Updates
+
+
+def _canonicalize_seq(seq: SOAPState) -> SOAPState:
+    """Ensure a GG/Q leaf is always a tuple.
+
+    New Flax versions may have already converted sequences into dict-like state
+    objects; if a State is encountered we sort by key and build a tuple.
+    """
+    new_GG = seq.GG
+    new_Q = seq.Q
+
+    if isinstance(seq.GG["kernel"], State):
+        GG = seq.GG["kernel"]
+        new_GG = State({'kernel': tuple(GG[k] for k in sorted(GG.keys()))})
+    if isinstance(seq.Q["kernel"], State):
+        Q = seq.Q["kernel"]
+        new_Q = State({'kernel': tuple(Q[k] for k in sorted(Q.keys()))})
+
+    return SOAPState(
+        count=seq.count,
+        exp_avg=seq.exp_avg,
+        exp_avg_sq=seq.exp_avg_sq,
+        GG=new_GG,
+        Q=new_Q,
+    )
 
 
 def soap(
@@ -95,16 +121,16 @@ def scale_by_soap(
     def init_fn(params: Updates) -> SOAPState:
         exp_avg = otu.tree_zeros_like(params)
         exp_avg_sq = otu.tree_zeros_like(params)
-        GG = jtu.tree_map(
+        GG = jax.tree.map(
             lambda p: init_conditioner(p, max_precond_dim),
             params,
         )
-        Q = jtu.tree_map(
+        Q = jax.tree.map(
             lambda p: init_conditioner(p, max_precond_dim),
             params,
         )
         return SOAPState(
-            count=jnp.zeros([], jnp.int32),
+            count=jnp.asarray(0, dtype=jnp.int32),
             exp_avg=exp_avg,
             exp_avg_sq=exp_avg_sq,
             GG=GG,
@@ -115,13 +141,13 @@ def scale_by_soap(
         updates: Updates,
         state: SOAPState,
     ) -> tuple[Updates, SOAPState]:
-        new_GG = jtu.tree_map(
+        new_GG = jax.tree.map(
             lambda grad, gg: update_preconditioner(grad, gg, shampoo_beta),
             updates,
             state.GG,
         )
 
-        new_Q = jtu.tree_map(
+        new_Q = jax.tree.map(
             lambda gg: get_orthogonal_matrix(gg),
             new_GG,
         )
@@ -129,14 +155,20 @@ def scale_by_soap(
         # Replace updates with zeros
         new_updates = otu.tree_zeros_like(updates)
 
-        return new_updates, state._replace(GG=new_GG, Q=new_Q)
+        return new_updates, SOAPState(
+            count=numerics.safe_increment(state.count),
+            exp_avg=state.exp_avg,
+            exp_avg_sq=state.exp_avg_sq,
+            GG=new_GG,
+            Q=new_Q,
+        )
 
     def update_step(
         updates: Updates,
         state: SOAPState,
     ) -> tuple[Updates, SOAPState]:
         # Project gradients
-        grad_projected = jtu.tree_map(
+        grad_projected = jax.tree.map(
             lambda grad, q: project(grad, q, precision),
             updates,
             state.Q,
@@ -146,14 +178,14 @@ def scale_by_soap(
         exp_avg = otu.tree_update_moment(updates, state.exp_avg, b1, 1)
         exp_avg_sq = otu.tree_update_moment_per_elem_norm(grad_projected, state.exp_avg_sq, b2, 2)
 
-        exp_avg_projected = jtu.tree_map(
+        exp_avg_projected = jax.tree.map(
             lambda e, q: project(e, q, precision),
             exp_avg,
             state.Q,
         )
 
         # Project back
-        norm_updates = jtu.tree_map(
+        norm_updates = jax.tree.map(
             lambda e_avg, e_avg_sq, q: project_back(e_avg / (jnp.sqrt(e_avg_sq) + eps), q, precision),
             exp_avg_projected,
             exp_avg_sq,
@@ -165,13 +197,13 @@ def scale_by_soap(
         corr = jnp.sqrt(bc2) / bc1
 
         # Bias correction on the updates
-        norm_updates = jtu.tree_map(
+        norm_updates = jax.tree.map(
             lambda p: p * corr,
             norm_updates,
         )
 
         # Update the preconditioner
-        new_GG = jtu.tree_map(
+        new_GG = jax.tree.map(
             lambda grad, gg: update_preconditioner(grad, gg, shampoo_beta, precision),
             updates,
             state.GG,
@@ -180,32 +212,32 @@ def scale_by_soap(
         # Update the orthogonal matrix / exp_avg_sq
         new_Q_and_exp_avg_sq = jax.lax.cond(
             state.count % precondition_frequency == 0,
-            lambda: jtu.tree_map(
+            lambda: jax.tree.map(
                 lambda e, gg, q: get_orthogonal_matrix_QR(gg, q, e, precision),
                 exp_avg_sq,
                 new_GG,
                 state.Q,
             ),
-            lambda: jtu.tree_map(
+            lambda: jax.tree.map(
                 lambda e, q: (q, e),
                 state.exp_avg_sq,
                 state.Q,
             ),
         )
         ## Unpack the results
-        new_Q = jtu.tree_map(
+        new_Q = jax.tree.map(
             lambda _, x: x[0],
             updates,
             new_Q_and_exp_avg_sq,
         )
-        exp_avg_sq = jtu.tree_map(
+        exp_avg_sq = jax.tree.map(
             lambda _, x: x[1],
             updates,
             new_Q_and_exp_avg_sq,
         )
 
         new_state = SOAPState(
-            count=state.count,
+            count=numerics.safe_increment(state.count),
             exp_avg=exp_avg,
             exp_avg_sq=exp_avg_sq,
             GG=new_GG,
@@ -216,13 +248,11 @@ def scale_by_soap(
 
     def update_fn(updates: Updates, state: SOAPState, params: Optional[Updates] = None) -> tuple[Updates, SOAPState]:
         del params
-        count_inc = jnp.asarray(optax.safe_int32_increment(state.count))
-        state = state._replace(count=count_inc)
-
+        newstate = _canonicalize_seq(state)
         updates, new_state = jax.lax.cond(
-            count_inc == 1,
-            lambda: init_step(updates, state),
-            lambda: update_step(updates, state),
+            state.count == 0,
+            lambda: init_step(updates, newstate),
+            lambda: update_step(updates, newstate),
         )
 
         return updates, new_state
@@ -232,33 +262,37 @@ def scale_by_soap(
 
 def update_preconditioner(
     grad: Array,
-    GG: List[Union[Array, None]],
+    GG: Sequence[Union[Array, None]],
     beta: float,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-) -> List[Union[Array, None]]:
-    if grad.ndim == 1:
-        return [lerp(GG[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta)]  # type: ignore
+) -> tuple[Union[Array, None], ...]:
+    """Update the SOAP preconditioner.
 
-    new_GG = []
+    Accepts GG as any sequence (tuple preferred). Returns a tuple to keep the
+    structure immutable for Flax nnx compatibility.
+    """
+    if grad.ndim == 1:
+        # Single dimension special case
+        return (lerp(GG[0], jnp.matmul(grad[:, None], grad[None, :], precision=precision), 1 - beta),)  # type: ignore
+
+    new_GG_list = []
     for idx, gg in enumerate(GG):
         if gg is None:
-            new_GG.append(None)
+            new_GG_list.append(None)
             continue
-
         outer_product = jnp.tensordot(
             grad,
             grad,
             axes=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
             precision=precision,
         )
-        new_GG.append(lerp(gg, outer_product, 1 - beta))
-
-    return new_GG
+        new_GG_list.append(lerp(gg, outer_product, 1 - beta))
+    return tuple(new_GG_list)
 
 
 def project(
     grad: Array,
-    Q: List[Union[Array, None]],
+    Q: Sequence[Union[Array, None]],
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
     for mat in Q:
@@ -272,13 +306,12 @@ def project(
         else:
             permute_order = list(range(1, len(grad.shape))) + [0]
             grad = jnp.transpose(grad, permute_order)
-
     return grad
 
 
 def project_back(
     grad: Array,
-    Q: List[Union[Array, None]],
+    Q: Sequence[Union[Array, None]],
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
 ) -> Array:
     for mat in Q:
@@ -291,7 +324,6 @@ def project_back(
             )
         else:
             grad = jnp.moveaxis(grad, 0, -1)
-
     return grad
 
 
@@ -304,17 +336,16 @@ def get_orthogonal_matrix(gg: Array) -> Union[Array, None]:
 
 
 def get_orthogonal_matrix_QR(
-    GG: List[Union[Array, None]],
-    Q: List[Union[Array, None]],
+    GG: Sequence[Union[Array, None]],
+    Q: Sequence[Union[Array, None]],
     exp_avg_sq: Array,
     precision: jax.lax.PrecisionLike = jax.lax.Precision.HIGHEST,
-) -> tuple[List[Union[Array, None]], Array]:
-    final_Q = []
+) -> tuple[tuple[Union[Array, None], ...], Array]:
+    final_Q_list = []
     for ind, (m, o) in enumerate(zip(GG, Q)):
         if m is None or o is None:
-            final_Q.append(None)
+            final_Q_list.append(None)
             continue
-
         est_eig = jnp.diag(
             jnp.matmul(
                 jnp.matmul(o.T, m, precision=precision),
@@ -327,22 +358,23 @@ def get_orthogonal_matrix_QR(
         o = o[:, sort_idx]
         power_iter = jnp.matmul(m, o, precision=precision)
         Q_new, _ = jnp.linalg.qr(power_iter)
-
-        final_Q.append(Q_new)
-
-    return final_Q, exp_avg_sq
+        final_Q_list.append(Q_new)
+    return tuple(final_Q_list), exp_avg_sq
 
 
 def lerp(
     start: Array,
     end: Array,
-    weight: Numeric,
+    weight: chex.Numeric,
 ):
     return start + weight * (end - start)
 
 
-def init_conditioner(p: Array, max_precond_dim: int) -> List[Union[Array, None]]:
-    if p.ndim == 1:
-        return [jnp.zeros((p.shape[0], p.shape[0]))]
+def init_conditioner(p: Array, max_precond_dim: int) -> tuple[Union[Array, None], ...]:
+    """Initialize the conditioner structure for a parameter tensor.
 
-    return [jnp.zeros((s, s)) if s <= max_precond_dim else None for s in p.shape]
+    Returns a tuple (immutable) of matrices / None entries for Flax nnx compatibility.
+    """
+    if p.ndim == 1:
+        return (jnp.zeros((p.shape[0], p.shape[0])),)
+    return tuple(jnp.zeros((s, s)) if s <= max_precond_dim else None for s in p.shape)

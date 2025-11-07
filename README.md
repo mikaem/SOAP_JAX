@@ -23,6 +23,11 @@ opt = soap(
 
 I've written it similarly to how optimizers in optax are defined, so you can also import `scale_by_soap` for just the gradient transformation.
 
+## Flax / nnx Compatibility Note
+Recent versions of Flax (nnx) treat mutable Python containers (like lists) inside optimizer state specially and may attempt to convert them into stateful dictionaries. Hence the SOAPState lists of arrays, `GG` and `Q`, are transformed into dictionaries. There is now added a small canonicalization helper to convert these back into tuples. Alternatively, the code must be modified in order to work around this behavior, but that seems like a larger change.
+
+No external API changed: `soap()` and `scale_by_soap()` behave the same, and `SOAPState` still exposes `GG` and `Q` (now as trees of tuples).
+
 ## JAX Specific Information
 I did not implement merging of dimensions or optionally preconditioning <2D parameters. I'll gladly take PR's implementing these features, they just weren't necessary for me. Further, this is the first time I've implemented an optimizer in JAX so I'd be happy to take PR's improving its implementation as well.
 
