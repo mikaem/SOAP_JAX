@@ -29,12 +29,28 @@ def _canonicalize_seq(seq: SOAPState) -> SOAPState:
     new_GG = seq.GG
     new_Q = seq.Q
 
-    if isinstance(seq.GG["kernel"], State):
-        GG = seq.GG["kernel"]
-        new_GG = State({'kernel': tuple(GG[k] for k in sorted(GG.keys()))})
-    if isinstance(seq.Q["kernel"], State):
-        Q = seq.Q["kernel"]
-        new_Q = State({'kernel': tuple(Q[k] for k in sorted(Q.keys()))})
+    def filter_dict_to_tuples(d):
+        """
+        Recursively process a nested dictionary and convert innermost dictionaries
+        with integer keys to tuples.
+        """
+        if not isinstance(d, (dict, State)):
+            return d
+
+        # First, recursively process all values
+        processed = {k: filter_dict_to_tuples(v) for k, v in d.items()}
+
+        # Then check if this dictionary should be converted to a tuple
+        # Only convert if all keys are integers AND all values are not dictionaries
+        if all(isinstance(k, int) for k in processed) and \
+           all(not isinstance(v, dict) for v in processed.values()):
+            # Convert to tuple, sorted by keys
+            return tuple(processed[k] for k in sorted(processed.keys()))
+
+        return processed
+
+    new_GG = State(filter_dict_to_tuples(new_GG))
+    new_Q = State(filter_dict_to_tuples(new_Q))
 
     return SOAPState(
         count=seq.count,
